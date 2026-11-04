@@ -41,6 +41,7 @@
 #define WM_TRAY      (WM_APP + 1)
 #define IDM_TOGGLE   1001
 #define IDM_EXIT     1002
+#define IDM_STATUS   1003
 
 typedef struct {
     UINT  vk, sc;     /* virtual key and scan code of the physical key */
@@ -81,6 +82,10 @@ static HWND   g_hwnd, g_lastfg;
 static NOTIFYICONDATAW g_nid;
 static BOOL   g_enabled = TRUE;
 static BOOL   g_injecting;
+/* counters only - no typed text is kept */
+static int    g_stat_delims, g_stat_unmatched, g_stat_checks, g_stat_fixes;
+static int    g_selftest[MAX_LANGS];   /* 0 = no sample word, 1 = passed, 2 = failed */
+static BOOL   g_kh_ok, g_mh_ok;
 
 /* ---------- word checking ---------- */
 
@@ -265,6 +270,9 @@ static int lang_of_layout(HKL h)
     int i;
     for (i = 0; i < g_nlay; i++)
         if (g_lay[i].hkl == h) return g_lay[i].lang;
+    /* fall back to the language id: the device half of the HKL can differ between APIs */
+    for (i = 0; i < g_nlay; i++)
+        if (((UINT_PTR)g_lay[i].hkl & 0xFFFF) == ((UINT_PTR)h & 0xFFFF)) return g_lay[i].lang;
     return -1;
 }
 
@@ -313,7 +321,9 @@ static BOOL decide(wchar_t out[MAX_TOK + 1], HKL *target)
     if (alen <= 0) return FALSE;
 
     cur = lang_of_layout(g_tok[g_ntok - 1].hkl);
-    if (cur < 0 || is_word(&g_langs[cur], actual, alen)) return FALSE;   /* valid where typed */
+    if (cur < 0) { g_stat_unmatched++; return FALSE; }
+    g_stat_checks++;
+    if (is_word(&g_langs[cur], actual, alen)) return FALSE;   /* valid where typed */
 
     for (i = 0; i < g_nlay; i++) {
         const Layout *L = &g_lay[i];
@@ -358,6 +368,7 @@ static void correct(int ntok, const wchar_t *text, UINT delim, HKL target)
     add_key(in, &n, (WORD)delim, 0, 0);          /* re-send the swallowed delimiter */
     add_key(in, &n, (WORD)delim, 0, KEYEVENTF_KEYUP);
 
+    g_stat_fixes++;
     g_injecting = TRUE;
     SendInput(n, in, sizeof in[0]);
     g_injecting = FALSE;
@@ -416,6 +427,7 @@ static LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
         wchar_t fixed[MAX_TOK + 1];
         HKL target = NULL;
         int ntok = g_ntok;
+        g_stat_delims++;
         BOOL fix = decide(fixed, &target);
         g_ntok = 0;
         if (fix) {
@@ -456,6 +468,59 @@ static LRESULT CALLBACK ms_proc(int code, WPARAM wp, LPARAM lp)
     return CallNextHookEx(NULL, code, wp, lp);
 }
 
+/* ---------- self-test and status ---------- */
+
+static const struct { const wchar_t *code, *word; } g_samples[] = {
+    {L"en", L"hello"}, {L"es", L"hola"}, {L"fr", L"bonjour"}, {L"de", L"hallo"},
+    {L"it", L"ciao"}, {L"pt", L"obrigado"},
+    {L"ru", L"\u043F\u0440\u0438\u0432\u0435\u0442"},          /* привет */
+    {L"he", L"\u05E9\u05DC\u05D5\u05DD"},                        /* שלום */
+    {L"el", L"\u03B3\u03B5\u03B9\u03B1"},                        /* γεια */
+    {L"ar", L"\u0645\u0631\u062D\u0628\u0627"},                 /* مرحبا */
+};
+
+static void self_test_all(void)
+{
+    int i, k, n = (int)(sizeof g_samples / sizeof g_samples[0]);
+    for (i = 0; i < g_nlang; i++) {
+        g_selftest[i] = 0;
+        for (k = 0; k < n; k++) {
+            if (!wcscmp(g_samples[k].code, g_langs[i].code)) {
+                const wchar_t *w = g_samples[k].word;
+                g_selftest[i] = is_word(&g_langs[i], w, (int)wcslen(w)) ? 1 : 2;
+                break;
+            }
+        }
+    }
+}
+
+static void show_status(void)
+{
+    wchar_t msg[2048], line[256];
+    int i;
+
+    lstrcpyW(msg, L"Layout Guard status\n\n");
+    wsprintfW(line, L"Keyboard hook: %s\nMouse hook: %s\n\n",
+              g_kh_ok ? L"running" : L"FAILED", g_mh_ok ? L"running" : L"FAILED");
+    lstrcatW(msg, line);
+
+    for (i = 0; i < g_nlang; i++) {
+        const wchar_t *how = g_langs[i].dict ? L"word list" :
+                             (g_langs[i].sc ? L"Windows spell checker" : L"none");
+        const wchar_t *res = g_selftest[i] == 1 ? L"self-test passed" :
+                             g_selftest[i] == 2 ? L"self-test FAILED" : L"no self-test word";
+        wsprintfW(line, L"%s: %s, %s\n", g_langs[i].code, how, res);
+        lstrcatW(msg, line);
+    }
+
+    wsprintfW(line, L"\nLayouts in use: %d\nWord endings seen (Space/Enter/Tab): %d\n"
+                    L"Words checked: %d\nKeys on an unrecognized layout: %d\nCorrections made: %d\n",
+              g_nlay, g_stat_delims, g_stat_checks, g_stat_unmatched, g_stat_fixes);
+    lstrcatW(msg, line);
+
+    MessageBoxW(NULL, msg, L"Layout Guard", MB_OK | MB_ICONINFORMATION);
+}
+
 /* ---------- tray UI ---------- */
 
 static void tray_add(void)                       /* called once at startup */
@@ -492,6 +557,7 @@ static void show_menu(HWND h)
     HMENU m = CreatePopupMenu();
     GetCursorPos(&p);
     AppendMenuW(m, MF_STRING | (g_enabled ? MF_CHECKED : 0), IDM_TOGGLE, L"Enabled");
+    AppendMenuW(m, MF_STRING, IDM_STATUS, L"Status...");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit");
     SetForegroundWindow(h);
@@ -509,6 +575,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_COMMAND:
         if (LOWORD(w) == IDM_TOGGLE) set_enabled(!g_enabled);
+        else if (LOWORD(w) == IDM_STATUS) show_status();
         else if (LOWORD(w) == IDM_EXIT) DestroyWindow(h);
         return 0;
     case WM_DESTROY:
@@ -539,6 +606,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show)
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     init_layouts();
+    self_test_all();
 
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = wnd_proc;
@@ -550,6 +618,11 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show)
     tray_add();
     g_kh = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, GetModuleHandleW(NULL), 0);
     g_mh = SetWindowsHookExW(WH_MOUSE_LL, ms_proc, GetModuleHandleW(NULL), 0);
+    g_kh_ok = g_kh != NULL;
+    g_mh_ok = g_mh != NULL;
+    if (!g_kh_ok || !g_mh_ok)
+        MessageBoxW(NULL, L"Layout Guard could not install its keyboard/mouse hooks.",
+                    L"Layout Guard", MB_OK | MB_ICONERROR);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
