@@ -3,17 +3,18 @@
  *
  * How it works
  *   - A low-level keyboard hook remembers the keys of the current word (in RAM only).
- *   - When a word ends (Space / Enter / Tab) it is checked against a per-language word list.
- *   - If the word is not valid in the active layout's language, but the same keys produce
- *     a valid word in another installed layout's language, the word is erased, retyped
+ *   - When a word ends (Space / Enter / Tab) it is checked with the Windows spell checker
+ *     for each installed layout's language.
+ *   - If the word is not valid in the active layout's language, but the same keys form a
+ *     valid word in another installed layout's language, the word is erased, retyped
  *     correctly and the keyboard layout is switched.
  *   - Nothing is written to disk and nothing leaves the machine.
  *
- * Word lists: put UTF-8 files (one lowercase word per line) in  <exe folder>\dict\<lang>.txt
- *   e.g. dict\en.txt, dict\he.txt, dict\ru.txt.  A layout is used only if its list exists.
+ * Optional override: a UTF-8 word list at  <exe folder>\dict\<lang>.txt (one lowercase word
+ * per line) is used instead of the Windows spell checker for that language.
  *
- * Build (MinGW):  x86_64-w64-mingw32-gcc -O2 -s -static -mwindows -municode LayoutGuard.c -o LayoutGuard.exe -luser32 -lshell32
- * Build (MSVC):   cl /O2 /MT /DUNICODE /D_UNICODE LayoutGuard.c /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib
+ * Build (MinGW): x86_64-w64-mingw32-gcc -O2 -s -static -mwindows -municode LayoutGuard.c -o LayoutGuard.exe -luser32 -lshell32 -lole32
+ * Build (MSVC):  cl /O2 /MT /DUNICODE /D_UNICODE LayoutGuard.c /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib ole32.lib
  */
 
 #ifndef UNICODE
@@ -22,9 +23,12 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+#define INITGUID
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <objbase.h>
 #include <shellapi.h>
+#include <spellcheck.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
@@ -32,6 +36,7 @@
 #define DOWN(vk)     ((GetAsyncKeyState(vk) & 0x8000) != 0)
 #define MAX_TOK      48          /* longest word we track; longer input resets the buffer */
 #define MAX_LAYOUTS  16
+#define MAX_LANGS    16
 #define MAX_DICTS    16
 #define WM_TRAY      (WM_APP + 1)
 #define IDM_TOGGLE   1001
@@ -51,16 +56,25 @@ typedef struct {
 } Dict;
 
 typedef struct {
-    HKL   hkl;
-    Dict *dict;
+    wchar_t        code[8];   /* primary language, e.g. "he" */
+    Dict          *dict;      /* optional word-list override */
+    ISpellChecker *sc;        /* Windows spell checker, used when no word list */
+} Lang;
+
+typedef struct {
+    HKL hkl;
+    int lang;                 /* index into g_langs */
 } Layout;
 
 static Tok    g_tok[MAX_TOK];
 static int    g_ntok;
 static Layout g_lay[MAX_LAYOUTS];
 static int    g_nlay;
+static Lang   g_langs[MAX_LANGS];
+static int    g_nlang;
 static Dict   g_dicts[MAX_DICTS];
 static int    g_ndicts;
+static ISpellCheckerFactory *g_fac;
 static wchar_t g_dir[MAX_PATH];
 static HHOOK  g_kh, g_mh;
 static HWND   g_hwnd, g_lastfg;
@@ -68,7 +82,7 @@ static NOTIFYICONDATAW g_nid;
 static BOOL   g_enabled = TRUE;
 static BOOL   g_injecting;
 
-/* ---------- word lists ---------- */
+/* ---------- word checking ---------- */
 
 static int cmp_word(const void *a, const void *b)
 {
@@ -151,18 +165,65 @@ static Dict *load_dict(const wchar_t *lang)
     return n ? d : NULL;
 }
 
-/* ---------- layouts ---------- */
-
-static BOOL lang_of(HKL h, wchar_t out[8])
+/* Is s (len chars) a correctly spelled word in language L? */
+static BOOL is_word(const Lang *L, const wchar_t *s, int len)
 {
-    wchar_t name[LOCALE_NAME_MAX_LENGTH];
-    LCID lcid = MAKELCID((LANGID)((UINT_PTR)h & 0xFFFF), SORT_DEFAULT);
-    int i = 0;
-    if (!LCIDToLocaleName(lcid, name, LOCALE_NAME_MAX_LENGTH, 0)) return FALSE;
-    for (; name[i] && name[i] != L'-' && i < 7; i++) out[i] = name[i];
-    out[i] = 0;
-    CharLowerBuffW(out, i);
-    return i > 0;
+    wchar_t tmp[MAX_TOK + 1];
+    IEnumSpellingError *en = NULL;
+    ISpellingError *err = NULL;
+    HRESULT hr;
+    BOOL ok;
+
+    if (len < 2 || len > MAX_TOK) return FALSE;
+    if (L->dict) return in_dict(L->dict, s, len);
+    if (!L->sc) return FALSE;
+
+    memcpy(tmp, s, len * sizeof(wchar_t));
+    tmp[len] = 0;
+    hr = L->sc->lpVtbl->Check(L->sc, tmp, &en);
+    if (FAILED(hr) || !en) return FALSE;
+    /* Enumerator yields one error item per misspelling; S_FALSE on the first call = no errors. */
+    hr = en->lpVtbl->Next(en, &err);
+    ok = (hr == S_FALSE);
+    if (err) err->lpVtbl->Release(err);
+    en->lpVtbl->Release(en);
+    return ok;
+}
+
+/* ---------- languages and layouts ---------- */
+
+static ISpellChecker *make_checker(const wchar_t *tag, const wchar_t *code)
+{
+    const wchar_t *cands[2];
+    int i;
+
+    if (!g_fac) return NULL;
+    cands[0] = tag;
+    cands[1] = code;
+    for (i = 0; i < 2; i++) {
+        WINBOOL supported = FALSE;
+        ISpellChecker *sc = NULL;
+        if (SUCCEEDED(g_fac->lpVtbl->IsSupported(g_fac, cands[i], &supported)) && supported &&
+            SUCCEEDED(g_fac->lpVtbl->CreateSpellChecker(g_fac, cands[i], &sc)) && sc)
+            return sc;
+    }
+    return NULL;
+}
+
+static int find_or_add_lang(const wchar_t *tag, const wchar_t *code)
+{
+    int i;
+    Lang *L;
+    for (i = 0; i < g_nlang; i++)
+        if (!wcscmp(g_langs[i].code, code)) return i;
+    if (g_nlang >= MAX_LANGS) return -1;
+
+    L = &g_langs[g_nlang];
+    memset(L, 0, sizeof *L);
+    lstrcpynW(L->code, code, 8);
+    L->dict = load_dict(code);
+    if (!L->dict) L->sc = make_checker(tag, code);
+    return g_nlang++;
 }
 
 static void init_layouts(void)
@@ -170,30 +231,41 @@ static void init_layouts(void)
     int i, n;
     HKL *list;
 
+    CoCreateInstance(&CLSID_SpellCheckerFactory, NULL, CLSCTX_INPROC_SERVER,
+                     &IID_ISpellCheckerFactory, (void **)&g_fac);
+
     n = GetKeyboardLayoutList(0, NULL);
     if (n <= 0) return;
     list = malloc(n * sizeof(HKL));
     if (!list) return;
     n = GetKeyboardLayoutList(n, list);
+
     for (i = 0; i < n && g_nlay < MAX_LAYOUTS; i++) {
-        wchar_t lang[8];
-        Dict *d;
-        if (!lang_of(list[i], lang)) continue;
-        d = load_dict(lang);
-        if (!d) continue;                        /* no word list -> layout not used */
+        wchar_t name[LOCALE_NAME_MAX_LENGTH], code[8];
+        int li, k = 0;
+        LCID lcid = MAKELCID((LANGID)((UINT_PTR)list[i] & 0xFFFF), SORT_DEFAULT);
+        if (!LCIDToLocaleName(lcid, name, LOCALE_NAME_MAX_LENGTH, 0)) continue;
+        for (; name[k] && name[k] != L'-' && k < 7; k++) code[k] = name[k];
+        code[k] = 0;
+        CharLowerBuffW(code, k);
+
+        li = find_or_add_lang(name, code);
+        if (li < 0) continue;
+        if (!g_langs[li].dict && !g_langs[li].sc) continue;   /* no checker for this language */
+
         g_lay[g_nlay].hkl = list[i];
-        g_lay[g_nlay].dict = d;
+        g_lay[g_nlay].lang = li;
         g_nlay++;
     }
     free(list);
 }
 
-static Dict *dict_of_layout(HKL h)
+static int lang_of_layout(HKL h)
 {
     int i;
     for (i = 0; i < g_nlay; i++)
-        if (g_lay[i].hkl == h) return g_lay[i].dict;
-    return NULL;
+        if (g_lay[i].hkl == h) return g_lay[i].lang;
+    return -1;
 }
 
 static HKL fg_layout(void)
@@ -234,23 +306,22 @@ static int build_text(HKL force, wchar_t *out)
 static BOOL decide(wchar_t out[MAX_TOK + 1], HKL *target)
 {
     wchar_t actual[MAX_TOK + 1];
-    const Dict *cur;
-    int alen, i;
+    int alen, cur, i;
 
     if (!g_ntok) return FALSE;
     alen = build_text(NULL, actual);
     if (alen <= 0) return FALSE;
 
-    cur = dict_of_layout(g_tok[g_ntok - 1].hkl);
-    if (!cur || in_dict(cur, actual, alen)) return FALSE;   /* valid where it was typed */
+    cur = lang_of_layout(g_tok[g_ntok - 1].hkl);
+    if (cur < 0 || is_word(&g_langs[cur], actual, alen)) return FALSE;   /* valid where typed */
 
     for (i = 0; i < g_nlay; i++) {
         const Layout *L = &g_lay[i];
         wchar_t cand[MAX_TOK + 1];
         int clen;
-        if (!L->dict || L->dict == cur) continue;
+        if (L->lang == cur) continue;
         clen = build_text(L->hkl, cand);
-        if (clen > 0 && in_dict(L->dict, cand, clen)) {
+        if (clen > 0 && is_word(&g_langs[L->lang], cand, clen)) {
             memcpy(out, cand, (clen + 1) * sizeof(wchar_t));
             *target = L->hkl;
             return TRUE;
@@ -390,7 +461,7 @@ static LRESULT CALLBACK ms_proc(int code, WPARAM wp, LPARAM lp)
 static void tray_add(void)                       /* called once at startup */
 {
     wchar_t tip[128];
-    wsprintfW(tip, L"Layout Guard: %s, %d layout(s) with word lists",
+    wsprintfW(tip, L"Layout Guard: %s, %d layout(s) active",
               g_enabled ? L"on" : L"paused", g_nlay);
     memset(&g_nid, 0, sizeof g_nid);
     g_nid.cbSize = sizeof g_nid;
@@ -405,15 +476,13 @@ static void tray_add(void)                       /* called once at startup */
 
 static void set_enabled(BOOL on)
 {
+    wchar_t tip[128];
     g_enabled = on;
     g_ntok = 0;
+    wsprintfW(tip, L"Layout Guard: %s, %d layout(s) active",
+              g_enabled ? L"on" : L"paused", g_nlay);
     g_nid.uFlags = NIF_TIP;
-    {
-        wchar_t tip[128];
-        wsprintfW(tip, L"Layout Guard: %s, %d layout(s) with word lists",
-                  g_enabled ? L"on" : L"paused", g_nlay);
-        lstrcpynW(g_nid.szTip, tip, ARRAYSIZE(g_nid.szTip));
-    }
+    lstrcpynW(g_nid.szTip, tip, ARRAYSIZE(g_nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
@@ -468,6 +537,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show)
     slash = wcsrchr(g_dir, L'\\');
     if (slash) slash[1] = 0;
 
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     init_layouts();
 
     memset(&wc, 0, sizeof wc);

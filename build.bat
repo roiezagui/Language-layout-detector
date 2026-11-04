@@ -4,13 +4,13 @@ rem The result is a single self-contained exe (no runtime install needed).
 
 where cl >nul 2>nul
 if %errorlevel%==0 (
-    cl /nologo /O2 /MT /DUNICODE /D_UNICODE LayoutGuard.c /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib /OUT:LayoutGuard.exe
+    cl /nologo /O2 /MT /DUNICODE /D_UNICODE LayoutGuard.c /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib ole32.lib /OUT:LayoutGuard.exe
     goto :end
 )
 
 where gcc >nul 2>nul
 if %errorlevel%==0 (
-    gcc -O2 -s -static -mwindows -municode LayoutGuard.c -o LayoutGuard.exe -luser32 -lshell32
+    gcc -O2 -s -static -mwindows -municode LayoutGuard.c -o LayoutGuard.exe -luser32 -lshell32 -lole32
     goto :end
 )
 

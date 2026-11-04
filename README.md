@@ -19,27 +19,20 @@ build.bat
 Or directly:
 
 ```bat
-gcc -O2 -s -static -mwindows -municode LayoutGuard.c -o LayoutGuard.exe -luser32 -lshell32
+gcc -O2 -s -static -mwindows -municode LayoutGuard.c -o LayoutGuard.exe -luser32 -lshell32 -lole32
 ```
 
-## Set up word lists
+## Languages
 
-The app decides "right vs wrong" with a dictionary per language. Create a `dict`
-folder next to `LayoutGuard.exe`, with one UTF-8 file per language, named by the
-language's primary code, one lowercase word per line:
+Layout Guard uses the **Windows spell checker** for every installed keyboard layout, so there is
+nothing to set up for most people. A layout is used when Windows has a spell checker for its language.
 
-```
-LayoutGuard.exe
-dict\
-    en.txt     <- English layout
-    he.txt     <- Hebrew layout
-    ru.txt     <- Russian layout (optional, any installed layout works)
-```
+To check that a language has one: Settings → Time & language → Language & region → (language) →
+Language options → make sure the **Spell check** feature is installed. If a layout is not
+used, check that its language is installed.
 
-A layout is used only when its word list exists. Keep the lists to a few tens of
-thousands of common words each (smaller = less memory and faster lookups). Word lists
-are not bundled here, because of their size and licensing; hunspell `.dic` word lists
-or frequency lists for your languages are good sources.
+**Optional override:** a word list at `dict\<lang>.txt` next to `LayoutGuard.exe` (UTF-8, one
+lowercase word per line, e.g. `dict\he.txt`) replaces the Windows spell checker for that language.
 
 ## Run
 
@@ -51,13 +44,13 @@ or frequency lists for your languages are good sources.
 ## How the decision is made
 
 1. The app keeps the keys of the current word (up to 48), together with the layout each was typed in.
-2. On Space, Enter or Tab it converts the keys under the active layout. If that text is in
-   that language's word list, nothing happens.
-3. Otherwise it converts the same keys under every other installed layout that has a word list.
-   If one of them is a known word, the app sends Backspace × N, types the word correctly
+2. On Space, Enter or Tab it converts the keys under the active layout. If that text is spelled
+   correctly in that layout's language, nothing happens.
+3. Otherwise it converts the same keys under every other installed layout. If one of them is a
+   correctly spelled word, the app sends Backspace × N, types the word correctly
    (Unicode input, so it does not depend on the layout), re-sends the Space/Enter/Tab,
    and asks the focused window to switch to that layout.
-4. Words that are not in any list are left alone. This is deliberate: names, slang and typos
+4. Words that are not spelled correctly in any of the layouts are left alone. This is deliberate: names, slang and typos
    are never "corrected".
 
 The word buffer is reset on: focus change, mouse click, arrow/Home/End/Delete/Esc keys,
@@ -65,7 +58,10 @@ Ctrl/Alt/Win shortcuts, and words longer than 48 keys.
 
 ## Limitations
 
-- **Dictionary-based**: quality depends on the word lists you provide.
+- **Spell-checker based**: a correctly spelled word in one language is also accepted there, and
+  names or slang that the spell checker doesn't know are left alone.
+- **Latency:** each word is checked with the Windows spell checker inside the keyboard hook. Windows
+  may drop a hook that stalls, so very slow spell checks could disable it.
 - **Layout switch** uses `WM_INPUTLANGCHANGEREQUEST`. Most apps follow it; some ignore it, in which
   case the text is still corrected but you may need to switch layouts yourself.
 - **Dead keys** (accents typed as two keys) and IME input (Japanese, Chinese) are not corrected:
@@ -75,11 +71,10 @@ Ctrl/Alt/Win shortcuts, and words longer than 48 keys.
 - **Password fields** are not detected. The hook sees all keystrokes in the session, but it only
   retains the current word and only rewrites it when a correction is actually triggered.
 - Verified so far: compiles cleanly for Windows x64 with MinGW-w64 (`-Wall -Wextra`). It has **not yet been run
-  on a Windows machine**, so the hook behaviour, layout switching and word-list decisions still need a manual test.
+  on a Windows machine**, so the hook behaviour, layout switching and spell-checker decisions still need a manual test.
 
 ## Privacy
 
 Nothing is logged, persisted or transmitted. The word buffer exists only in memory and is cleared
 at every word boundary and focus change. Verify this yourself: the source is one file,
-[`LayoutGuard.c`](LayoutGuard.c), and it has no network or file-write code paths other than reading
-`dict\*.txt`.
+[`LayoutGuard.c`](LayoutGuard.c), and it has no network or file-write code paths. It only reads the optional `dict\*.txt` files.
