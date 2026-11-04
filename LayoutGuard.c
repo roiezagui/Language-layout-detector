@@ -84,6 +84,9 @@ static BOOL   g_enabled = TRUE;
 static BOOL   g_injecting;
 /* counters only - no typed text is kept */
 static int    g_stat_delims, g_stat_unmatched, g_stat_checks, g_stat_fixes;
+static int    g_stat_keys;             /* key-down events the hook received */
+static DWORD  g_last_key_tick;         /* GetTickCount of the last key-down */
+static DWORD  g_slowest_ms;            /* slowest word decision, in ms */
 static int    g_selftest[MAX_LANGS];   /* 0 = no sample word, 1 = passed, 2 = failed */
 static BOOL   g_kh_ok, g_mh_ok;
 
@@ -395,6 +398,8 @@ static LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
         g_injecting || (k->flags & LLKHF_INJECTED))
         return CallNextHookEx(NULL, code, wp, lp);
 
+    g_stat_keys++;
+    g_last_key_tick = GetTickCount();
     fg = GetForegroundWindow();
     if (fg != g_lastfg) { g_lastfg = fg; g_ntok = 0; }   /* focus moved: forget the word */
 
@@ -428,7 +433,12 @@ static LRESULT CALLBACK kb_proc(int code, WPARAM wp, LPARAM lp)
         HKL target = NULL;
         int ntok = g_ntok;
         g_stat_delims++;
-        BOOL fix = decide(fixed, &target);
+        BOOL fix;
+        {
+            DWORD t0 = GetTickCount();
+            fix = decide(fixed, &target);
+            if (GetTickCount() - t0 > g_slowest_ms) g_slowest_ms = GetTickCount() - t0;
+        }
         g_ntok = 0;
         if (fix) {
             correct(ntok, fixed, vk, target);
@@ -513,9 +523,14 @@ static void show_status(void)
         lstrcatW(msg, line);
     }
 
-    wsprintfW(line, L"\nLayouts in use: %d\nWord endings seen (Space/Enter/Tab): %d\n"
-                    L"Words checked: %d\nKeys on an unrecognized layout: %d\nCorrections made: %d\n",
-              g_nlay, g_stat_delims, g_stat_checks, g_stat_unmatched, g_stat_fixes);
+    wsprintfW(line, L"\nLayouts in use: %d\nKey presses seen by hook: %d\n"
+                    L"Seconds since last key press: %d\n"
+                    L"Word endings seen (Space/Enter/Tab): %d\nWords checked: %d\n"
+                    L"Keys on an unrecognized layout: %d\nCorrections made: %d\n"
+                    L"Slowest word check: %d ms\n",
+              g_nlay, g_stat_keys,
+              g_last_key_tick ? (int)((GetTickCount() - g_last_key_tick) / 1000) : -1,
+              g_stat_delims, g_stat_checks, g_stat_unmatched, g_stat_fixes, (int)g_slowest_ms);
     lstrcatW(msg, line);
 
     MessageBoxW(NULL, msg, L"Layout Guard", MB_OK | MB_ICONINFORMATION);
